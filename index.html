@@ -284,6 +284,15 @@
   .drawer .ditem.active { background: var(--drawer-active); color:var(--drawer-text); font-weight: 700; }
   .drawer .ditem.active svg { color:var(--drawer-text); }
   .drawer .dfoot { font-size: 11px; opacity:.45; padding: 20px 22px 28px; }
+  .drawer .sync-row { display:flex; align-items:center; gap:8px; padding: 8px 22px 4px; }
+  .drawer .sync-btn { background: var(--accent); color:#fff; border:none; border-radius:8px; padding: 8px 16px; font-size:13px; font-weight:600; cursor:pointer; }
+  .drawer .sync-btn:disabled { opacity:.5; }
+  .drawer .sync-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .drawer .sync-dot.ok { background:#22c55e; }
+  .drawer .sync-dot.sync { background:#f59e0b; animation: pulse 1s infinite; }
+  .drawer .sync-dot.err { background:#ef4444; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .drawer .sync-text { font-size:12px; opacity:.6; }
 
   /* ---------- modal ---------- */
   .overlay { position: fixed; inset: 0; background: color-mix(in srgb, var(--text) 44%, transparent); backdrop-filter: blur(3px); z-index: 60;
@@ -396,6 +405,15 @@
   </div>
   <div class="dsep"></div>
   <div id="drawerList"></div>
+  <div class="dsep"></div>
+  <div class="sync-row">
+    <span class="sync-dot ok" id="syncDot"></span>
+    <span class="sync-text" id="syncText">云端同步未配置</span>
+  </div>
+  <div class="sync-row" style="padding-top:0">
+    <button class="sync-btn" id="syncBtn">立即同步</button>
+    <button class="sync-btn" id="setupBtn" style="background:var(--surface-card);color:var(--text);border:1px solid var(--border-input)">设置</button>
+  </div>
   <div class="dsep"></div>
   <div class="dfoot" id="drawerFoot">数据仅存在本机 · 每日更新</div>
 </aside>
@@ -573,6 +591,96 @@ function avgProgress(list){
 const modOf = k => CONFIG.modules.find(m=>m.key===k);
 const $ = s => document.querySelector(s);
 
+/* ---------- cloud sync via GitHub Gist ---------- */
+const SYNC = {
+  token: localStorage.getItem('__sync_token') || '',
+  gistId: localStorage.getItem('__sync_gist_id') || '',
+  fileName: 'workbench-data.json',
+  lastSync: 0,
+  syncing: false,
+
+  configured() { return !!this.token; },
+
+  async createGist(dataStr) {
+    const resp = await fetch('https://api.github.com/gists', {
+      method: 'POST',
+      headers: { 'Authorization': `token ${this.token}`, 'Content-Type': 'application/json', 'Accept': 'application/vnd.github.v3+json' },
+      body: JSON.stringify({ description: 'Workbench Cloud Sync', public: false, files: { [this.fileName]: { content: dataStr } } })
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const r = await resp.json();
+    this.gistId = r.id;
+    localStorage.setItem('__sync_gist_id', this.gistId);
+    return r;
+  },
+
+  async push(data) {
+    if (!this.configured() || this.syncing) return;
+    this.syncing = true;
+    this.setUI('sync', '同步中...');
+    try {
+      const dataStr = JSON.stringify(data);
+      if (!this.gistId) {
+        await this.createGist(dataStr);
+      } else {
+        const resp = await fetch(`https://api.github.com/gists/${this.gistId}`, {
+          method: 'PATCH',
+          headers: { 'Authorization': `token ${this.token}`, 'Content-Type': 'application/json', 'Accept': 'application/vnd.github.v3+json' },
+          body: JSON.stringify({ files: { [this.fileName]: { content: dataStr } } })
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      }
+      this.lastSync = Date.now();
+      this.setUI('ok', '已同步 ' + new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'}));
+    } catch(e) {
+      this.setUI('err', '同步失败: ' + e.message);
+    } finally {
+      this.syncing = false;
+    }
+  },
+
+  async pull() {
+    if (!this.configured()) return null;
+    if (!this.gistId) return null;
+    this.setUI('sync', '拉取云端...');
+    try {
+      const resp = await fetch(`https://api.github.com/gists/${this.gistId}`, {
+        headers: { 'Authorization': `token ${this.token}`, 'Accept': 'application/vnd.github.v3+json' }
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const r = await resp.json();
+      const file = r.files && r.files[this.fileName];
+      if (file && file.content) {
+        const cloudData = JSON.parse(file.content);
+        this.lastSync = Date.now();
+        this.setUI('ok', '已同步 ' + new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'}));
+        return cloudData;
+      }
+      this.setUI('ok', '云端无数据');
+      return null;
+    } catch(e) {
+      this.setUI('err', '拉取失败: ' + e.message);
+      return null;
+    }
+  },
+
+  setUI(state, text) {
+    const dot = $('#syncDot');
+    const txt = $('#syncText');
+    if (!dot || !txt) return;
+    dot.className = 'sync-dot ' + state;
+    txt.textContent = text;
+  },
+
+  initUI() {
+    if (this.configured()) {
+      this.setUI('ok', '上次同步 ' + (this.lastSync ? new Date(this.lastSync).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) : '从未'));
+    } else {
+      this.setUI('err', '点击「设置」配置云同步');
+    }
+  }
+};
+
 const store = {
   load(){
     const raw = localStorage.getItem(CONFIG.storageKey);
@@ -581,7 +689,29 @@ const store = {
     CONFIG.modules.forEach(m => d[m.key] = structuredClone(m.seed||[]));
     return d;
   },
-  save(){ localStorage.setItem(CONFIG.storageKey, JSON.stringify(data)); },
+  save(){
+    localStorage.setItem(CONFIG.storageKey, JSON.stringify(data));
+    // Debounced cloud sync
+    clearTimeout(store._syncTimer);
+    store._syncTimer = setTimeout(() => SYNC.push(data), 1500);
+  },
+  async loadFromCloud(){
+    const cloud = await SYNC.pull();
+    if (cloud) {
+      // Merge: cloud takes priority for items not yet on this device
+      // But if local has newer data, keep local
+      const localData = this.load();
+      // Simple strategy: cloud data replaces local if it has more content
+      const localCount = Object.values(localData).reduce((s,v) => s + (Array.isArray(v)?v.length:0), 0);
+      const cloudCount = Object.values(cloud).reduce((s,v) => s + (Array.isArray(v)?v.length:0), 0);
+      if (cloudCount >= localCount) {
+        data = cloud;
+        localStorage.setItem(CONFIG.storageKey, JSON.stringify(data));
+        return true;
+      }
+    }
+    return false;
+  }
 };
 let data = store.load();
 let view = "home";            // home | insight | <moduleKey>
@@ -1127,6 +1257,57 @@ $("#nav").querySelectorAll(".n").forEach(n=>n.onclick=()=>{
   else go(t);
 });
 
+/* ---------- cloud sync UI ---------- */
+SYNC.initUI();
+// Sync button - push current data to cloud
+$("#syncBtn").onclick = async () => {
+  if (!SYNC.configured()) { showSyncSetup(); return; }
+  $("#syncBtn").disabled = true;
+  await SYNC.push(data);
+  $("#syncBtn").disabled = false;
+};
+// Setup button - show token input dialog
+$("#setupBtn").onclick = showSyncSetup;
+
+function showSyncSetup() {
+  const overlay = document.createElement('div');
+  overlay.className = 'overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="grab"></div>
+      <h2>配置云同步</h2>
+      <p class="sub">通过 GitHub Token 实现跨设备数据同步</p>
+      <div class="field">
+        <label>GitHub Personal Access Token（需要 gist 权限）</label>
+        <input type="password" id="syncTokenInput" placeholder="ghp_..." value="${SYNC.token}" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--border-input);font-size:14px"/>
+      </div>
+      <div class="field" id="gistIdField" style="${SYNC.gistId?'':'display:none'}">
+        <label>Gist ID（已自动配置）</label>
+        <input type="text" id="gistIdInput" value="${SYNC.gistId}" readonly style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--border-input);font-size:14px;opacity:.6"/>
+      </div>
+      <p class="sub" style="margin-top:8px;line-height:1.5">获取方式：打开 github.com → Settings → Developer settings → Personal access tokens → Generate new token（classic），勾选 <b>gist</b> 权限，生成后复制到上方。</p>
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button class="sync-btn" id="syncSave" style="flex:1">保存</button>
+        <button class="sync-btn" id="syncCancel" style="flex:1;background:var(--surface-card);color:var(--text);border:1px solid var(--border-input)">取消</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.onclick = e => { if(e.target===overlay) close(); };
+  overlay.querySelector("#syncCancel").onclick = close;
+  overlay.querySelector("#syncSave").onclick = async () => {
+    const token = overlay.querySelector("#syncTokenInput").value.trim();
+    if (!token) return;
+    SYNC.token = token;
+    localStorage.setItem('__sync_token', token);
+    close();
+    SYNC.initUI();
+    // Auto-push current data to create gist
+    await SYNC.push(data);
+    render();
+  };
+}
+
 /* ---------- avatar upload ---------- */
 $("#brandCam").innerHTML = icon("camera",18);
 if(data.__avatar) $("#brandImg").src = data.__avatar;
@@ -1146,6 +1327,15 @@ function attr(s){ return esc(s).replace(/"/g,'&quot;'); }
 
 buildDrawer();
 render();
+
+// Auto-pull from cloud on page load
+if (SYNC.configured()) {
+  (async () => {
+    SYNC.setUI('sync', '拉取云端...');
+    const updated = await store.loadFromCloud();
+    if (updated) { render(); }
+  })();
+}
 </script>
 </body>
 </html>
